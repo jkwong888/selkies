@@ -19,10 +19,12 @@ package pod_broker
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -33,8 +35,12 @@ import (
 	"time"
 
 	metadata "cloud.google.com/go/compute/metadata"
+	"cloud.google.com/go/pubsub"
+	oauth2 "golang.org/x/oauth2/google"
+	"google.golang.org/api/option"
 )
 
+const GCRImageWithoutTagPattern = `gcr.io.*$`
 const GCRImageWithTagPattern = `gcr.io.*:.*$`
 const GCRImageWithDigestPattern = `gcr.io.*@sha256.*$`
 
@@ -80,7 +86,7 @@ func GetServiceAccountFromMetadataServer() (string, error) {
 
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", url, nil)
-	req.Header.Add("Metadata-Flavor", "Google")
+	req.Header.Set("Metadata-Flavor", "Google")
 	resp, err := client.Do(req)
 	if err != nil {
 		return sa, err
@@ -105,7 +111,7 @@ func GetServiceAccountTokenFromMetadataServer(sa string) (string, error) {
 
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", url, nil)
-	req.Header.Add("Metadata-Flavor", "Google")
+	req.Header.Set("Metadata-Flavor", "Google")
 	resp, err := client.Do(req)
 	if err != nil {
 		return sa, err
@@ -133,6 +139,9 @@ func ExtractGCRRepoFromImage(image string) string {
 	} else if len(regexp.MustCompile(GCRImageWithDigestPattern).FindAllString(image, -1)) > 0 {
 		// Extract just the repo/image format from the image, excluding the digest at the end.
 		gcrRepo = strings.Split(strings.ReplaceAll(image, "gcr.io/", ""), "@")[0]
+	} else if len(regexp.MustCompile(GCRImageWithoutTagPattern).FindAllString(image, -1)) > 0 {
+		// Already have repo without tag.
+		gcrRepo = strings.ReplaceAll(image, "gcr.io/", "")
 	}
 	return gcrRepo
 }
@@ -148,7 +157,8 @@ func ListGCRImageTags(image string, authToken string) (ImageListResponse, error)
 
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", url, nil)
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", authToken))
+	req.Header.Set("User-Agent", "Selkies_Controller/1.0")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
 	resp, err := client.Do(req)
 	if err != nil {
 		return listResp, err
@@ -168,6 +178,28 @@ func ListGCRImageTags(image string, authToken string) (ImageListResponse, error)
 	}
 
 	return listResp, nil
+}
+
+func GetGCRDigestFromTag(repo, tag string, authToken string) (string, error) {
+	url := fmt.Sprintf("https://gcr.io/v2/%s/manifests/%s", repo, tag)
+
+	client := &http.Client{}
+	req, err := http.NewRequest("HEAD", url, nil)
+	req.Header.Set("User-Agent", "Selkies_Controller/1.0")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("error fetching HEAD request, status code: %v", resp.StatusCode)
+	}
+
+	digest := resp.Header.Get("docker-content-digest")
+
+	return digest, nil
 }
 
 func ListGCRImageTagsInternalMetadataToken(image string) (ImageListResponse, error) {
@@ -325,6 +357,46 @@ func ListPods(namespace, selector string) ([]string, error) {
 	return resp, nil
 }
 
+func GetPubSubSubscription(subName, topicName, project, saEmail string) (*pubsub.Subscription, error) {
+	var sub *pubsub.Subscription
+
+	var opts []option.ClientOption
+	opts = append(opts, option.WithTokenSource(oauth2.ComputeTokenSource(saEmail)))
+
+	ctx := context.Background()
+	client, err := pubsub.NewClient(ctx, project, opts...)
+	if err != nil {
+		return sub, fmt.Errorf("failed to create pubsub client: %v", err)
+	}
+
+	// Verify topic exists
+	topic := client.Topic(topicName)
+	ok, err := topic.Exists(ctx)
+	if err != nil {
+		return sub, fmt.Errorf("fmt.Errorfailed to check if topic exists: %v", err)
+	}
+	if !ok {
+		return sub, fmt.Errorf("topic does not exist: %s", topicName)
+	}
+
+	// Check for existing subscription for this node, create one if needed.
+	sub = client.Subscription(subName)
+	ok, err = sub.Exists(ctx)
+	if err != nil {
+		return sub, fmt.Errorf("failed to check if subscription exists: %v", err)
+	}
+	if !ok {
+		log.Printf("creating subscription: %s", subName)
+		var err error
+		sub, err = client.CreateSubscription(ctx, subName, pubsub.SubscriptionConfig{Topic: topic})
+		if err != nil {
+			return sub, fmt.Errorf("failed to create pubsub subscription: %v", err)
+		}
+	}
+
+	return sub, nil
+}
+
 var seededRand *rand.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func StringWithCharset(length int, charset string) string {
@@ -333,4 +405,13 @@ func StringWithCharset(length int, charset string) string {
 		b[i] = charset[seededRand.Intn(len(charset))]
 	}
 	return string(b)
+}
+
+func K8sTimestampToUnix(k8sTimestamp string) string {
+	t, err := time.Parse(time.RFC3339, k8sTimestamp)
+	if err != nil {
+		log.Printf("WARN: failed to parse timestamp '%s': %v", k8sTimestamp, err)
+		return ""
+	}
+	return fmt.Sprintf("%d", t.Unix())
 }

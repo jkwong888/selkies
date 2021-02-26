@@ -1,4 +1,4 @@
-# Copyright 2019 Google LLC
+# Copyright 2021 The Selkies Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +17,8 @@ substitutions:
   _ACTION: apply
   _NAME: broker
   _REGION: us-west1
-  _COS: "true"
-  _UBUNTU: "true"
 tags:
-  - selkies-node-pool-gpu
+  - selkies-cluster
   - selkies-setup
 steps:
   ###
@@ -33,7 +31,5 @@ steps:
       - TF_VAR_project_id=${PROJECT_ID}
       - TF_VAR_name=${_NAME}
       - TF_VAR_region=${_REGION}
-      - TF_VAR_gpu_cos_pool_enabled=${_COS}
-      - TF_VAR_gpu_ubuntu_pool_enabled=${_UBUNTU}
-      - TERRAFORM_WORKSPACE_NAME=node-pool-gpu-${_REGION}
+      - TERRAFORM_WORKSPACE_NAME=lb-${_REGION}
       - ACTION=${_ACTION}

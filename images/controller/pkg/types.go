@@ -222,6 +222,7 @@ type AppListResponse struct {
 	BrokerRegion string            `json:"brokerRegion"`
 	Apps         []AppDataResponse `json:"apps"`
 	User         string            `json:"user"`
+	LogoutURL    string            `json:"logoutURL"`
 }
 
 type AppDataResponse struct {
@@ -241,15 +242,16 @@ type AppDataResponse struct {
 }
 
 type StatusResponse struct {
-	Code          int                `json:"code"`
-	Status        string             `json:"status"`
-	Nodes         []string           `json:"nodes,omitempty"`
-	Containers    map[string]string  `json:"containers,omitempty"`
-	Images        map[string]string  `json:"images,omitempty"`
-	PodIPs        []string           `json:"pod_ips,omitempty"`
-	PodStatus     *PodStatusResponse `json:"pod_status,omitempty"`
-	SessionKeys   []string           `json:"session_keys"`
-	BrokerObjects []string           `json:"broker_objects"`
+	Code              int                `json:"code"`
+	Status            string             `json:"status"`
+	Nodes             []string           `json:"nodes,omitempty"`
+	Containers        map[string]string  `json:"containers,omitempty"`
+	Images            map[string]string  `json:"images,omitempty"`
+	PodIPs            []string           `json:"pod_ips,omitempty"`
+	PodStatus         *PodStatusResponse `json:"pod_status,omitempty"`
+	SessionKeys       []string           `json:"session_keys"`
+	BrokerObjects     []string           `json:"broker_objects"`
+	CreationTimestamp string             `json:"creation_timestamp"`
 }
 
 type PodStatusResponse struct {
@@ -267,9 +269,10 @@ type ImageListManifestResponse struct {
 }
 
 type ReservationMetadataSpec struct {
-	IP         string `json:"ip"`
-	SessionKey string `json:"session_key"`
-	User       string `json:"user"`
+	IP           string `json:"ip"`
+	SessionKey   string `json:"session_key"`
+	User         string `json:"user"`
+	SessionStart string `json:"session_start"`
 }
 
 /*
@@ -360,4 +363,10 @@ type JobStatusSpec struct {
 type GetJobSpec struct {
 	Metadata map[string]interface{} `json:"metadata"`
 	Status   JobStatusSpec          `json:"status"`
+}
+
+type GCRPubSubMessage struct {
+	Action string `json:"action"`
+	Digest string `json:"digest"`
+	Tag    string `json:"tag"`
 }

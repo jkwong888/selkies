@@ -16,7 +16,7 @@
 
 module "broker" {
   source = "terraform-google-modules/kubernetes-engine/google//modules/beta-private-cluster-update-variant"
-
+  version = "12.3.0"
   project_id                = var.project_id
   release_channel           = "REGULAR"
   name                      = "${var.name}-${var.region}"
@@ -35,6 +35,7 @@ module "broker" {
   enable_private_endpoint   = false
   enable_private_nodes      = true
   default_max_pods_per_node = var.max_pods_per_node
+  gce_pd_csi_driver         = true
 
   // Enable network metering to track per-user traffic.
   // https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-usage-metering#enable-network-egress-metering

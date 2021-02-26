@@ -56,6 +56,8 @@ func main() {
 		appConfigs, err := broker.FetchBrokerAppConfigs(namespace)
 		if err != nil {
 			log.Printf("failed to fetch broker app configs: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
 		// List of app specs that will be added to the registered app manifest.
@@ -65,12 +67,16 @@ func main() {
 		nsConfigMaps, err := broker.GetConfigMaps(namespace)
 		if err != nil {
 			log.Printf("failed to fetch broker appconfig map bundles: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
 		}
 
 		// Fetch data required for Egress Network Policy
 		networkPolicyData, err := broker.GetEgressNetworkPolicyData(namespace)
 		if err != nil {
 			log.Printf("failed to fetch networkpolicy data: %v", err)
+			time.Sleep(2 * time.Second)
+			continue
 		}
 		registeredApps.NetworkPolicyData = networkPolicyData
 
@@ -125,9 +131,9 @@ func main() {
 					for _, data := range cm.Data {
 						scanner := bufio.NewScanner(strings.NewReader(data))
 						for scanner.Scan() {
-							userPat := scanner.Text()
-							// Skip comment lines.
-							if !strings.HasPrefix(userPat, "#") {
+							userPat := strings.TrimSpace(scanner.Text())
+							// Skip comment and empty lines.
+							if len(userPat) > 0 && !strings.HasPrefix(userPat, "#") {
 								_, err := regexp.Compile(userPat)
 								if err != nil {
 									log.Printf("WARN: invalid authorized user pattern found in ConfigMap %s: '%s', skipped.", authzCMName, userPat)

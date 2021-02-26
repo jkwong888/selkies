@@ -12,18 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-namespace: pod-broker-system
-
-generatorOptions:
-  # Generate stable ConfigMap and Secret names.
-  disableNameSuffixHash: true
-
-bases:
-  - app-publisher/
-  - image-puller/
-
-resources:
-  - namespace.yaml
-  - crd.yaml
-  - broker-deployment.yaml
-  - network-policy.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pd-balanced
+provisioner: pd.csi.storage.gke.io
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
+parameters:
+  type: pd-balanced

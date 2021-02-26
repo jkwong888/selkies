@@ -30,6 +30,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	broker "selkies.io/controller/pkg"
@@ -89,6 +90,12 @@ func main() {
 		log.Fatal("Missing POD_BROKER_PARAM_Domain env.")
 	}
 
+	// Logout URL from params
+	logoutURL, ok := sysParams["LogoutURL"]
+	if !ok {
+		logoutURL = fmt.Sprintf("https://%s/_gcp_iap/clear_login_cookie", domain)
+	}
+
 	// AuthHeader from params
 	authHeaderName, ok := sysParams["AuthHeader"]
 	if !ok {
@@ -103,6 +110,15 @@ func main() {
 		log.Fatal("Missing POD_BROKER_PARAM_AuthorizedUserRepoPattern env.")
 	}
 	allowedRepoPattern := regexp.MustCompile(allowedRepoPatternParam)
+
+	// Mutex for serializing per-user/per-app operations.
+	type appLock struct {
+		sync.RWMutex
+	}
+	appSync := make(map[string]*appLock, 0)
+
+	// Mutex for serializing per-user operations.
+	userSync := make(map[string]*appLock, 0)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := sysParams["Debug"]; ok {
@@ -146,9 +162,16 @@ func main() {
 				BrokerRegion: brokerRegion,
 				Apps:         make([]broker.AppDataResponse, 0),
 				User:         user,
+				LogoutURL:    logoutURL,
 			}
 
 			for _, app := range registeredApps.Apps {
+				srcPath := path.Join(broker.BundleSourceBaseDir, app.Name)
+				if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+					log.Printf("WARN: missing bundle source directory for app: %s", app.Name)
+					continue
+				}
+
 				if app.UserParams == nil {
 					// default user params to empty list.
 					app.UserParams = make([]broker.AppConfigParam, 0)
@@ -304,6 +327,16 @@ func main() {
 
 		ts := fmt.Sprintf("%d", time.Now().Unix())
 
+		// Lock per-user/per-app operations.
+		if lock, ok := appSync[fullName]; ok {
+			lock.Lock()
+			defer lock.Unlock()
+		} else {
+			appSync[fullName] = &appLock{}
+			appSync[fullName].Lock()
+			defer appSync[fullName].Unlock()
+		}
+
 		// Fetch user config, only use user options if spec.disableOptions is false.
 		userConfig, err := broker.GetAppUserConfig(userConfigFile)
 		if app.DisableOptions || err != nil {
@@ -335,8 +368,8 @@ func main() {
 		srcDirUser := path.Join(broker.UserBundleSourceBaseDir, appName)
 		destDirUser := path.Join(broker.BuildSourceBaseDirNS, user)
 
-		// Handle requests for per-app metadata requests
-		if regexp.MustCompile(fmt.Sprintf(".*%s/metadata/?$", appName)).MatchString(r.URL.Path) {
+		// Handle requests for per-app session info requests
+		if regexp.MustCompile(fmt.Sprintf(".*%s/session/?$", appName)).MatchString(r.URL.Path) {
 			// Fetch pod status
 			status, err := broker.GetPodStatus(namespace, fmt.Sprintf("app.kubernetes.io/instance=%s,app=%s", fullName, app.ServiceName))
 			if err != nil {
@@ -354,9 +387,10 @@ func main() {
 				sessionKey = status.SessionKeys[0]
 			}
 			metadata := broker.ReservationMetadataSpec{
-				IP:         ip,
-				SessionKey: sessionKey,
-				User:       user,
+				IP:           ip,
+				SessionKey:   sessionKey,
+				User:         user,
+				SessionStart: broker.K8sTimestampToUnix(status.CreationTimestamp),
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -426,11 +460,13 @@ func main() {
 				// Verifiy image repo and tag exists if it was changed.
 				if inputConfigSpec.ImageRepo != userConfig.Spec.ImageRepo || inputConfigSpec.ImageTag != userConfig.Spec.ImageTag {
 					log.Printf("validating user image repo: %s:%s", inputConfigSpec.ImageRepo, inputConfigSpec.ImageTag)
-					if err := broker.ValidateImageRepo(inputConfigSpec.ImageRepo, inputConfigSpec.ImageTag, allowedRepoPattern); err != nil {
+					imageTags, err := broker.ValidateImageRepo(inputConfigSpec.ImageRepo, inputConfigSpec.ImageTag, allowedRepoPattern)
+					if err != nil {
 						log.Printf("user %s config image validation failed: %v", user, err)
 						writeResponse(w, http.StatusBadRequest, fmt.Sprintf("%v", err))
 						return
 					}
+					inputConfigSpec.Tags = imageTags
 				}
 
 				// Verify parameters are valid for this app.
@@ -486,6 +522,14 @@ func main() {
 			return
 		}
 
+		// Fetch the current pod status
+		status, err := broker.GetPodStatus(namespace, fmt.Sprintf("app.kubernetes.io/instance=%s,app=%s", fullName, app.ServiceName))
+		if err != nil {
+			log.Printf("failed to get pod status: %v", err)
+			writeResponse(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+
 		// Extract query parameters
 		// Note that only the first instance of a repeated query param is used.
 		queryParams := make(map[string]string, len(r.URL.Query()))
@@ -516,7 +560,12 @@ func main() {
 			appParams[param.Name] = param.Default
 		}
 
-		// Generate session key. Add to AppParams
+		// If pod is already created, use existing sessionKey
+		if status.Status != "shutdown" && len(status.SessionKeys) > 0 {
+			appParams["sessionKey"] = status.SessionKeys[0]
+		}
+
+		// Generate new session key if one was not already found.
 		if _, ok := appParams["sessionKey"]; !ok {
 			appParams["sessionKey"] = broker.MakeSessionKey()
 		}
@@ -570,11 +619,23 @@ func main() {
 		}
 
 		// Build user namespace template.
+
+		// Lock per-user operation
+		var userLock *appLock
+		if lock, ok := userSync[user]; ok {
+			userLock = lock
+		} else {
+			userSync[user] = &appLock{}
+			userLock = userSync[user]
+		}
+		userLock.Lock()
 		if err := broker.BuildDeploy(broker.BrokerCommonBuildSourceBaseDirStatefulSetUser, srcDirUser, destDirUser, userNSData); err != nil {
 			log.Printf("%v", err)
 			writeResponse(w, http.StatusInternalServerError, "internal server error")
+			userLock.Unlock()
 			return
 		}
+		userLock.Unlock()
 
 		if shutdown {
 			if _, err := os.Stat(destDir); os.IsNotExist(err) {
@@ -590,18 +651,10 @@ func main() {
 				}
 			}
 
-			// Fetch pod status to retrieve the list of object types.
-			status, err := broker.GetPodStatus(namespace, fmt.Sprintf("app.kubernetes.io/instance=%s,app=%s", fullName, app.ServiceName))
-			if err != nil {
-				log.Printf("failed to get pod status: %v", err)
-				writeResponse(w, http.StatusInternalServerError, "internal server error")
-				return
-			}
-
 			if len(status.BrokerObjects) > 0 {
 				log.Printf("shutting down %s pod for user: %s", appName, user)
 				objectTypes := strings.Join(status.BrokerObjects, ",")
-				cmd := exec.Command("sh", "-o", "pipefail", "-c", fmt.Sprintf("kubectl delete %s -n %s -l \"app.kubernetes.io/instance=%s\" --wait=false", objectTypes, namespace, fullName))
+				cmd := exec.Command("sh", "-o", "pipefail", "-c", fmt.Sprintf("kubectl delete %s -n %s -l \"app.kubernetes.io/instance=%s, app.broker/deletion-policy notin (abandon)\" --wait=false", objectTypes, namespace, fullName))
 				cmd.Dir = destDir
 				stdoutStderr, err := cmd.CombinedOutput()
 				if err != nil {
@@ -619,14 +672,6 @@ func main() {
 		}
 
 		if getStatus {
-			// Get pod status based on conditions.
-			status, err := broker.GetPodStatus(namespace, fmt.Sprintf("app.kubernetes.io/instance=%s,app=%s", fullName, app.ServiceName))
-			if err != nil {
-				log.Printf("failed to get pod ips: %v", err)
-				writeResponse(w, http.StatusInternalServerError, "internal server error")
-				return
-			}
-
 			statusCode := http.StatusOK
 
 			if status.Status == "waiting" {
@@ -651,20 +696,30 @@ func main() {
 		}
 
 		if create {
-			log.Printf("creating pod for user: %s: %s", user, fullName)
-			cmd := exec.Command("sh", "-o", "pipefail", "-c", fmt.Sprintf("kustomize build %s | kubectl apply -f - && kustomize build %s | kubectl apply -f -", destDirUser, destDir))
-			cmd.Dir = destDir
-			stdoutStderr, err := cmd.CombinedOutput()
-			if err != nil {
-				log.Printf("error calling kubectl for %s: %v\n%s", user, err, stdoutStderr)
-				writeResponse(w, http.StatusInternalServerError, "internal server error")
-				return
+			if status.Status == "shutdown" {
+				userLock.Lock()
+				defer userLock.Unlock()
+
+				log.Printf("creating pod for user: %s: %s", user, fullName)
+				cmd := exec.Command("sh", "-o", "pipefail", "-c", fmt.Sprintf("kustomize build %s | kubectl apply -f - && kustomize build %s | kubectl apply -f -", destDirUser, destDir))
+				cmd.Dir = destDir
+				stdoutStderr, err := cmd.CombinedOutput()
+				if err != nil {
+					log.Printf("error calling kubectl for %s: %v\n%s", user, err, stdoutStderr)
+					writeResponse(w, http.StatusInternalServerError, "internal server error")
+					return
+				}
+
+				broker.SetCookie(w, cookieName, cookieValue, appPath, maxCookieAgeSeconds)
+
+				writeResponse(w, http.StatusAccepted, "created")
+				log.Printf("pod created for user: %s: %s", user, fullName)
+			} else {
+				broker.SetCookie(w, cookieName, cookieValue, appPath, maxCookieAgeSeconds)
+
+				writeResponse(w, http.StatusCreated, "created")
+				log.Printf("pod already created for user: %s: %s", user, fullName)
 			}
-
-			broker.SetCookie(w, cookieName, cookieValue, appPath, maxCookieAgeSeconds)
-
-			writeResponse(w, http.StatusAccepted, "created")
-			log.Printf("pod created for user: %s: %s", user, fullName)
 		}
 	})
 

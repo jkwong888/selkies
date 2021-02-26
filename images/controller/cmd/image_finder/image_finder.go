@@ -17,52 +17,174 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path"
+	"strings"
+	"sync"
 	"time"
 
+	"cloud.google.com/go/pubsub"
 	broker "selkies.io/controller/pkg"
 )
 
+// Interval to re-check all configs, in seconds.
+const checkInterval = 300
+
+// pubsub message receive context timeout in seconds
+const pubsubRecvTimeout = 2
+
 func main() {
+	// Sleep if disabled via env
+	if enabledEnv := os.Getenv("POD_BROKER_PARAM_EnableImagePuller"); enabledEnv == "false" {
+		log.Printf("Image finder disabled via env param POD_BROKER_PARAM_EnableImagePuller, sleeping")
+		for {
+			time.Sleep(1000 * time.Second)
+		}
+	}
+	project, err := broker.GetProjectID()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	log.Printf("Starting image tag discovery service")
+	// Set from downward API.
+	nodeName := os.Getenv("NODE_NAME")
+	if len(nodeName) == 0 {
+		log.Fatal("Missing NODE_NAME env.")
+	}
 
+	// Obtain Service Account email
+	saEmail, err := broker.GetServiceAccountFromMetadataServer()
+	if err != nil {
+		log.Fatalf("failed to get service account email: %v", err)
+	}
+
+	topicName := os.Getenv("TOPIC_NAME")
+	if len(topicName) == 0 {
+		topicName = "gcr"
+	}
+
+	// Perform initial check
+	checkUserConfigs()
+
+	// Subscribe to GCR pub/sub topic
+	subName := fmt.Sprintf("pod-broker-image-finder-%s", nodeName)
+	var sub *pubsub.Subscription
+
+	// Poll until subscription is obtained
 	for {
-		// Fetch all user app configs
-		userConfigs, err := broker.FetchAppUserConfigs()
+		sub, err = broker.GetPubSubSubscription(subName, topicName, project, saEmail)
 		if err != nil {
-			log.Fatalf("failed to fetch user app configs: %v", err)
+			log.Printf("error getting subscription for topic %s: %v", topicName, err)
+		} else {
+			break
 		}
+		time.Sleep(2 * time.Minute)
+	}
 
-		// Get service account name from metadata server
-		sa, err := broker.GetServiceAccountFromMetadataServer()
-		if err != nil {
-			log.Fatalf("failed to get service account name from metadata server: %v", err)
-		}
+	// Go routine to process all messages from subscription
+	go func() {
+		log.Printf("starting GCR pubsub worker")
+		var mu sync.Mutex
+		for {
+			cctx, cancelRecv := context.WithTimeout(context.Background(), pubsubRecvTimeout*time.Second)
+			defer cancelRecv()
 
-		// Get access token from metadata server
-		token, err := broker.GetServiceAccountTokenFromMetadataServer(sa)
-		if err != nil {
-			log.Fatalf("failed to get token from metadata server: %v", err)
-		}
+			if err := sub.Receive(cctx, func(ctx context.Context, m *pubsub.Message) {
+				defer m.Ack()
+				mu.Lock()
+				defer mu.Unlock()
 
-		// Discover image tags in parallel for all app specs.
-		for i := range userConfigs {
+				var message broker.GCRPubSubMessage
+				if err := json.Unmarshal(m.Data, &message); err != nil {
+					log.Printf("error decoding GCR message: %v", err)
+					return
+				}
 
-			destDir := path.Join(broker.AppUserConfigBaseDir, userConfigs[i].Spec.AppName, userConfigs[i].Spec.User)
-			err = os.MkdirAll(destDir, os.ModePerm)
-			if err != nil {
-				log.Fatalf("failed to create directory: %v", err)
+				if len(message.Tag) > 0 {
+					// Fetch all user app configs
+					userConfigs, err := broker.FetchAppUserConfigs()
+					if err != nil {
+						log.Fatalf("failed to fetch user app configs: %v", err)
+					}
+
+					// Update list of tags for all user configs that use this image.
+					for i := range userConfigs {
+						imageToks := strings.Split(message.Tag, ":")
+						imageRepo := imageToks[0]
+						imageTag := imageToks[1]
+
+						if imageRepo == userConfigs[i].Spec.ImageRepo {
+							log.Printf("updating list of tags for app: %s, user: %s", userConfigs[i].Spec.AppName, userConfigs[i].Spec.User)
+
+							destDir := path.Join(broker.AppUserConfigBaseDir, userConfigs[i].Spec.AppName, userConfigs[i].Spec.User)
+							err = os.MkdirAll(destDir, os.ModePerm)
+							if err != nil {
+								log.Fatalf("failed to create directory: %v", err)
+							}
+
+							// Update tags
+							userConfigs[i].Spec.Tags = append(userConfigs[i].Spec.Tags, imageTag)
+
+							// Save app config to local file.
+							if err := userConfigs[i].WriteJSON(path.Join(destDir, broker.AppUserConfigJSONFile)); err != nil {
+								log.Printf("failed to save copy of user app config: %v", err)
+								return
+							}
+						}
+					}
+				} else {
+					fmt.Printf("skipping gcr message because message is missing image tag: %s", message.Digest)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}); err != nil {
+				fmt.Printf("error receiving message: %v\n", err)
 			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
 
-			// Fetch in go routine.
-			go getImageTags(userConfigs[i], destDir, token)
+	log.Printf("starting user config watcher")
+	for {
+		// Check all user configs
+		checkUserConfigs()
+		time.Sleep(checkInterval * time.Second)
+	}
+}
+
+func checkUserConfigs() {
+	// Fetch all user app configs
+	userConfigs, err := broker.FetchAppUserConfigs()
+	if err != nil {
+		log.Fatalf("failed to fetch user app configs: %v", err)
+	}
+
+	// Get service account name from metadata server
+	sa, err := broker.GetServiceAccountFromMetadataServer()
+	if err != nil {
+		log.Fatalf("failed to get service account name from metadata server: %v", err)
+	}
+
+	// Get access token from metadata server
+	token, err := broker.GetServiceAccountTokenFromMetadataServer(sa)
+	if err != nil {
+		log.Fatalf("failed to get token from metadata server: %v", err)
+	}
+
+	// Discover image tags in parallel for all app specs.
+	for i := range userConfigs {
+
+		destDir := path.Join(broker.AppUserConfigBaseDir, userConfigs[i].Spec.AppName, userConfigs[i].Spec.User)
+		err = os.MkdirAll(destDir, os.ModePerm)
+		if err != nil {
+			log.Fatalf("failed to create directory: %v", err)
 		}
 
-		time.Sleep(10 * time.Second)
+		// Fetch in go routine.
+		go getImageTags(userConfigs[i], destDir, token)
 	}
 }
 

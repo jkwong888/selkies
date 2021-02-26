@@ -176,20 +176,26 @@ spec:
       timeoutSeconds: 10
 ---
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: pod-broker
 spec:
   selector:
     matchLabels:
       app: pod-broker
-  serviceName: pod-broker
   replicas: 1
-  volumeClaimTemplates: []
+  minReadySeconds: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 0%
   template:
     metadata:
       labels:
         app: pod-broker
+      annotations:
+        app.broker/config-hash: "deadbeef"
     spec:
       serviceAccountName: pod-broker
       terminationGracePeriodSeconds: 5
@@ -268,6 +274,10 @@ spec:
           readinessProbe:
             tcpSocket:
               port: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
         ###
         # reservation-broker
         ###
@@ -302,6 +312,10 @@ spec:
           readinessProbe:
             tcpSocket:
               port: 8082
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
         ###
         # App config finder sidecar
         ###
@@ -321,7 +335,10 @@ spec:
               mountPath: /var/run/buildsrc
             - name: userconfig
               mountPath: /var/run/userconfig
-
+          resources:
+            requests:
+              cpu: 200m
+              memory: 64Mi
         ###
         # Image finding sidecar
         ###
@@ -329,16 +346,28 @@ spec:
           image: gcr.io/cloud-solutions-images/kube-pod-broker-controller:latest
           workingDir: /var/run/build
           command: ["/usr/local/bin/image-finder"]
+          envFrom:
+            - configMapRef:
+                name: pod-broker-config
+                optional: false
           env:
             - name: NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
             - name: build-statefulsets
               mountPath: /var/run/build
             - name: userconfig
               mountPath: /var/run/userconfig
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
 
         ###
         # App publisher sidecar
@@ -366,6 +395,10 @@ spec:
           readinessProbe:
             tcpSocket:
               port: 8080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
 
         ###
         # pod-broker web
@@ -377,3 +410,7 @@ spec:
           readinessProbe:
             httpGet:
               port: 80
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
