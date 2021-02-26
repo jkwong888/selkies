@@ -26,7 +26,7 @@ variable tier1_pool_enabled {
   default = true
 }
 variable tier1_pool_machine_type {
-  default = "e2-standard-4"
+  default = "e2-standard-2"
 }
 variable tier1_pool_initial_node_count {
   default = 1
@@ -52,7 +52,7 @@ variable tier1_ubuntu_pool_enabled {
   default = false
 }
 variable tier1_ubuntu_pool_machine_type {
-  default = "e2-standard-4"
+  default = "e2-standard-2"
 }
 variable tier1_ubuntu_pool_initial_node_count {
   default = 1
@@ -78,7 +78,7 @@ variable tier2_pool_enabled {
   default = false
 }
 variable tier2_pool_machine_type {
-  default = "e2-highcpu-32"
+  default = "e2-standard-4"
 }
 variable tier2_pool_initial_node_count {
   default = 0

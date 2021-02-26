@@ -30,22 +30,22 @@ variable gpu_cos_accelerator_type {
   default = ""
 }
 variable gpu_cos_pool_machine_type {
-  default = "n1-standard-8"
+  default = "n1-standard-4"
 }
 variable gpu_cos_pool_initial_node_count {
-  default = 1
+  default = 0
 }
 variable gpu_cos_pool_min_node_count {
   default = 0
 }
 variable gpu_cos_pool_max_node_count {
-  default = 10
+  default = 3
 }
 variable gpu_cos_pool_preemptive_nodes {
-  default = false
+  default = true
 }
 variable gpu_cos_pool_disk_size_gb {
-  default = 100
+  default = 200
 }
 variable gpu_cos_pool_disk_type {
   default = "pd-balanced"
@@ -53,7 +53,7 @@ variable gpu_cos_pool_disk_type {
 
 # GPU Ubuntu node pool parameters
 variable gpu_ubuntu_pool_enabled {
-  default = true
+  default = false
 }
 variable gpu_ubuntu_pool_machine_type {
   default = "n1-standard-8"
@@ -72,10 +72,10 @@ variable gpu_ubuntu_pool_max_node_count {
   default = 10
 }
 variable gpu_ubuntu_pool_preemptive_nodes {
-  default = false
+  default = true
 }
 variable gpu_ubuntu_pool_disk_size_gb {
-  default = 100
+  default = 200
 }
 variable gpu_ubuntu_pool_disk_type {
   default = "pd-balanced"
